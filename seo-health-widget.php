@@ -27,8 +27,11 @@ require_once SEOHW_DIR . 'includes/class-seohw-audit.php';
 require_once SEOHW_DIR . 'includes/class-seohw-widget.php';
 
 SEOHW_Settings::init();
+SEOHW_GSC_Client::init();
 SEOHW_Widget::init();
 SEOHW_Audit::init();
 
 register_activation_hook( __FILE__, array( 'SEOHW_Audit', 'schedule' ) );
+register_activation_hook( __FILE__, array( 'SEOHW_GSC_Client', 'schedule' ) );
 register_deactivation_hook( __FILE__, array( 'SEOHW_Audit', 'unschedule' ) );
+register_deactivation_hook( __FILE__, array( 'SEOHW_GSC_Client', 'unschedule' ) );

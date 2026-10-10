@@ -10,42 +10,117 @@ class SEOHW_GSC_Client {
 	const SCOPE       = 'https://www.googleapis.com/auth/webmasters.readonly';
 	const TOKEN_URL   = 'https://oauth2.googleapis.com/token';
 	const API_BASE    = 'https://www.googleapis.com/webmasters/v3/sites/';
-	const CACHE_TTL   = 12 * HOUR_IN_SECONDS;
-	const ERROR_TTL   = HOUR_IN_SECONDS;
-	const TOKEN_CACHE = 'seohw_access_token';
+	const CACHE_TTL    = 12 * HOUR_IN_SECONDS; // Age after which a report is refreshed.
+	const ERROR_TTL    = HOUR_IN_SECONDS; // Age after which a failed fetch is retried.
+	const STORE_TTL    = 2 * DAY_IN_SECONDS; // How long a stale report can still be shown.
+	const LAG_DAYS     = 3; // Search Console data lags by 2-3 days.
+	const TOKEN_CACHE  = 'seohw_access_token';
+	const REFRESH_HOOK = 'seohw_refresh_report';
+	const REFRESH_LOCK = 'seohw_refresh_lock';
+
+	public static function init() {
+		add_action( self::REFRESH_HOOK, array( __CLASS__, 'refresh' ) );
+		add_action(
+			'init',
+			static function () {
+				if ( ! wp_next_scheduled( self::REFRESH_HOOK ) ) {
+					self::schedule();
+				}
+			}
+		);
+	}
 
 	/**
-	 * Dashboard data for the configured property, cached for 12 hours.
+	 * Refreshes the report twice a day in the background, so the dashboard rarely waits on Google.
+	 */
+	public static function schedule() {
+		if ( ! wp_next_scheduled( self::REFRESH_HOOK ) ) {
+			wp_schedule_event( time() + 2 * MINUTE_IN_SECONDS, 'twicedaily', self::REFRESH_HOOK );
+		}
+	}
+
+	public static function unschedule() {
+		wp_clear_scheduled_hook( self::REFRESH_HOOK );
+	}
+
+	/**
+	 * Dashboard data for the configured property.
 	 *
-	 * Each refresh makes 4 Search Console calls: current totals, previous totals,
-	 * daily clicks and top queries.
+	 * Reports are refreshed in the background (twice a day, plus whenever the dashboard finds
+	 * a stale one), so this normally returns the cached copy without calling Google. It only
+	 * fetches while the page waits when nothing is cached yet, e.g. right after setup.
 	 *
 	 * @return array|WP_Error
 	 */
 	public static function get_report() {
-		$property = SEOHW_Settings::get( 'property' );
-		if ( '' === $property ) {
+		if ( '' === SEOHW_Settings::get( 'property' ) ) {
 			return new WP_Error( 'seohw_no_property', __( 'No Search Console property is configured.', 'seo-health-widget' ) );
 		}
 
-		$ranges    = self::ranges( SEOHW_Settings::get( 'period' ) );
-		$cache_key = 'seohw_report_' . md5( (int) get_option( 'seohw_cache_gen', 1 ) . '|' . $property . '|' . $ranges['current']['start'] . '|' . $ranges['current']['end'] );
-		$cached    = get_transient( $cache_key );
-		if ( is_array( $cached ) ) {
-			return isset( $cached['error'] ) ? new WP_Error( $cached['code'], $cached['error'] ) : $cached;
+		$cached = get_transient( self::cache_key() );
+		if ( ! is_array( $cached ) ) {
+			return self::refresh();
 		}
 
-		$report = self::fetch_report( $property, $ranges );
+		if ( self::is_stale( $cached ) ) {
+			self::schedule_refresh();
+		}
+		return isset( $cached['error'] ) ? new WP_Error( $cached['code'], $cached['error'] ) : $cached;
+	}
+
+	/**
+	 * Fetches a fresh report and caches it. Each refresh makes 4 Search Console calls:
+	 * current totals, previous totals, daily clicks and top queries.
+	 *
+	 * @return array|WP_Error|null Null when unconfigured or another refresh is running.
+	 */
+	public static function refresh() {
+		$property = SEOHW_Settings::get( 'property' );
+		if ( '' === $property || get_transient( self::REFRESH_LOCK ) ) {
+			return null;
+		}
+		set_transient( self::REFRESH_LOCK, 1, 2 * MINUTE_IN_SECONDS );
+
+		$report = self::fetch_report( $property, self::ranges( SEOHW_Settings::get( 'period' ) ) );
 		if ( is_wp_error( $report ) ) {
-			set_transient(
-				$cache_key,
-				array( 'code' => $report->get_error_code(), 'error' => $report->get_error_message() ),
-				self::ERROR_TTL
+			$stored = array(
+				'code'    => $report->get_error_code(),
+				'error'   => $report->get_error_message(),
+				'fetched' => time(),
 			);
 		} else {
-			set_transient( $cache_key, $report, self::CACHE_TTL );
+			$stored = $report;
 		}
+		set_transient( self::cache_key(), $stored, self::STORE_TTL );
+		delete_transient( self::REFRESH_LOCK );
+
 		return $report;
+	}
+
+	private static function cache_key() {
+		return 'seohw_report_' . md5( (int) get_option( 'seohw_cache_gen', 1 ) . '|' . SEOHW_Settings::get( 'property' ) . '|' . SEOHW_Settings::get( 'period' ) );
+	}
+
+	/**
+	 * A report is stale when it's past its age limit or covers a different date range than
+	 * today's (the 28-day window moves daily; the month view moves monthly).
+	 */
+	private static function is_stale( array $cached ) {
+		if ( isset( $cached['error'] ) ) {
+			return time() - (int) $cached['fetched'] > self::ERROR_TTL;
+		}
+		return time() - (int) $cached['fetched'] > self::CACHE_TTL
+			|| self::ranges( SEOHW_Settings::get( 'period' ) ) !== $cached['ranges'];
+	}
+
+	/**
+	 * Queues a background refresh to run on the next WP-Cron tick, unless one is already due soon.
+	 */
+	private static function schedule_refresh() {
+		$next = wp_next_scheduled( self::REFRESH_HOOK );
+		if ( false === $next || $next > time() + 15 * MINUTE_IN_SECONDS ) {
+			wp_schedule_single_event( time(), self::REFRESH_HOOK );
+		}
 	}
 
 	private static function fetch_report( $property, $ranges ) {
@@ -118,20 +193,29 @@ class SEOHW_GSC_Client {
 	}
 
 	/**
-	 * Current and previous date ranges. Search Console reports in Pacific time and
-	 * lags by 2-3 days, so rolling ranges end 3 days ago.
+	 * Current and previous date ranges. Search Console reports in Pacific time and lags by
+	 * 2-3 days, so ranges never include the last LAG_DAYS days:
+	 *
+	 * - 28 days: the 28 days ending LAG_DAYS ago, vs. the 28 days before.
+	 * - Month: last month vs. the month before. During the first LAG_DAYS days of a month,
+	 *   last month's final days aren't in yet, so it compares the two months before that
+	 *   instead; otherwise the incomplete month would show a false drop.
+	 *
+	 * @param string                 $period 'month' or '28d'.
+	 * @param DateTimeImmutable|null $today  Override for testing.
 	 */
-	public static function ranges( $period ) {
-		$today = new DateTimeImmutable( 'today', new DateTimeZone( 'America/Los_Angeles' ) );
+	public static function ranges( $period, $today = null ) {
+		$today = $today ?? new DateTimeImmutable( 'today', new DateTimeZone( 'America/Los_Angeles' ) );
 
 		if ( '28d' === $period ) {
-			$cur_end   = $today->modify( '-3 days' );
-			$cur_start = $cur_end->modify( '-27 days' );
+			$cur_end    = $today->modify( '-' . self::LAG_DAYS . ' days' );
+			$cur_start  = $cur_end->modify( '-27 days' );
 			$prev_end   = $cur_start->modify( '-1 day' );
 			$prev_start = $prev_end->modify( '-27 days' );
 		} else {
-			$cur_start  = $today->modify( 'first day of last month' );
-			$cur_end    = $today->modify( 'last day of last month' );
+			$ref        = (int) $today->format( 'j' ) <= self::LAG_DAYS ? $today->modify( 'first day of last month' ) : $today;
+			$cur_start  = $ref->modify( 'first day of last month' );
+			$cur_end    = $ref->modify( 'last day of last month' );
 			$prev_start = $cur_start->modify( 'first day of last month' );
 			$prev_end   = $cur_start->modify( '-1 day' );
 		}

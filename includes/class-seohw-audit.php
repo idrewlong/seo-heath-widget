@@ -23,6 +23,9 @@ class SEOHW_Audit {
 
 	private $remote_budget = 0;
 
+	/** @var array<string, array> Link check results for this request, keyed by URL. */
+	private $url_memo = array();
+
 	public static function init() {
 		add_action( SEOHW_CRON_HOOK, array( __CLASS__, 'start' ) );
 		add_action( self::CONTINUE_HOOK, array( __CLASS__, 'resume' ) );
@@ -149,15 +152,16 @@ class SEOHW_Audit {
 			'total'             => self::count_items( $post_types ),
 			'cursor'            => 0, // Highest post ID processed so far.
 			'scanned'           => 0,
-			'counts'            => array( 'noindex' => 0, 'no_meta' => 0, 'broken' => 0 ),
+			'counts'            => array( 'noindex' => 0, 'no_meta' => 0, 'broken' => 0, 'unchecked' => 0 ),
 			'noindex'           => array(),
 			'no_meta'           => array(),
 			'broken'            => array(),
+			'unchecked'         => array(), // Links whose status couldn't be confirmed, with the reason.
+			'unchecked_seen'    => array(), // URL => true, so each unchecked URL is counted once.
 			'linked'            => array(), // Post IDs that something links to, as keys.
 			'orphan_candidates' => array(),
-			'remote_cache'      => array(), // URL => status code, or false when unreachable.
+			'remote_cache'      => array(), // URL => status code, or 0 when there was no response.
 			'remote_checked'    => 0,
-			'remote_skipped'    => 0,
 		);
 	}
 
@@ -264,6 +268,16 @@ class SEOHW_Audit {
 						'reason' => $result['broken'],
 					)
 				);
+			} elseif ( $result['unchecked'] && ! isset( $this->state['unchecked_seen'][ $result['url'] ] ) ) {
+				$this->state['unchecked_seen'][ $result['url'] ] = true;
+				$this->add_issue(
+					'unchecked',
+					array(
+						'post'   => $post->ID,
+						'url'    => $result['url'],
+						'reason' => $result['unchecked'],
+					)
+				);
 			}
 		}
 	}
@@ -302,11 +316,11 @@ class SEOHW_Audit {
 			'meta_checked'   => (bool) SEOHW_SEO_Meta::active_plugin(),
 			'orphan_types'   => $this->state['orphan_types'],
 			'remote_checked' => $this->state['remote_checked'],
-			'remote_skipped' => $this->state['remote_skipped'],
 			'counts'         => $this->state['counts'] + array( 'orphans' => count( $orphans ) ),
 			'noindex'        => $this->state['noindex'],
 			'no_meta'        => $this->state['no_meta'],
 			'broken'         => $this->state['broken'],
+			'unchecked'      => $this->state['unchecked'],
 			'orphans'        => array_slice( $orphans, 0, self::LIST_LIMIT ),
 		);
 	}
@@ -373,47 +387,173 @@ class SEOHW_Audit {
 		return strtok( $href, '#' );
 	}
 
+	/**
+	 * @return array{url: string, target: int, broken: string, unchecked: string}
+	 *         broken: why the link is broken ('' if it isn't); unchecked: why its status
+	 *         couldn't be confirmed ('' if it could).
+	 */
 	private function check_url( $url ) {
-		$result = array(
-			'url'    => $url,
-			'target' => 0,
-			'broken' => '',
-		);
+		if ( ! isset( $this->url_memo[ $url ] ) ) {
+			$this->url_memo[ $url ] = array_merge(
+				array(
+					'url'       => $url,
+					'target'    => 0,
+					'broken'    => '',
+					'unchecked' => '',
+				),
+				$this->classify_url( $url )
+			);
+		}
+		return $this->url_memo[ $url ];
+	}
 
+	/**
+	 * Works out a link's status as cheaply as possible: from WordPress data first, and over
+	 * HTTP only for links nothing else explains.
+	 */
+	private function classify_url( $url ) {
 		$path = (string) wp_parse_url( $url, PHP_URL_PATH );
 		if ( preg_match( '#/(wp-admin|wp-login\.php|wp-json|feed)(/|$)#', $path ) ) {
-			return $result;
+			return array();
 		}
 
 		$id = $this->resolve_id( $url );
-
 		if ( $id ) {
 			$status = get_post_status( $id );
 			if ( false === $status ) {
-				$result['broken'] = 'deleted';
-			} elseif ( 'publish' !== $status ) {
-				$result['broken'] = 'unpublished';
-			} else {
-				$result['target'] = $id;
+				return array( 'broken' => 'deleted' );
 			}
-			return $result;
+			if ( 'publish' !== $status ) {
+				return array( 'broken' => 'unpublished' );
+			}
+			return array( 'target' => $id );
 		}
 
-		$home_path = untrailingslashit( (string) wp_parse_url( home_url(), PHP_URL_PATH ) );
-		if ( '' === trim( substr( $path, strlen( $home_path ) ), '/' ) ) {
-			return $result; // Home page.
+		if ( $this->is_known_archive( $url ) || $this->is_existing_upload( $path ) ) {
+			return array();
 		}
 
 		if ( $this->is_unpublished_slug( $path ) ) {
-			$result['broken'] = 'unpublished';
-			return $result;
+			return array( 'broken' => 'unpublished' );
 		}
 
 		$status = $this->remote_status( $url );
 		if ( 404 === $status || 410 === $status ) {
-			$result['broken'] = (string) $status;
+			return array( 'broken' => (string) $status );
 		}
-		return $result;
+		if ( null === $status ) {
+			return array( 'unchecked' => 'limit' );
+		}
+		if ( 0 === $status ) {
+			return array( 'unchecked' => 'no_response' );
+		}
+		if ( $status >= 400 ) {
+			// Server errors, or a firewall/security plugin refusing the request (401, 403, 429).
+			return array( 'unchecked' => (string) $status );
+		}
+		return array();
+	}
+
+	/**
+	 * Path relative to the home URL, without slashes at either end or trailing /page/N.
+	 */
+	private function relative_path( $url ) {
+		$path      = rawurldecode( (string) wp_parse_url( $url, PHP_URL_PATH ) );
+		$home_path = untrailingslashit( (string) wp_parse_url( home_url(), PHP_URL_PATH ) );
+		if ( '' !== $home_path && 0 === strpos( $path, $home_path ) ) {
+			$path = substr( $path, strlen( $home_path ) );
+		}
+		return preg_replace( '#(^|/)page/\d+$#', '', trim( $path, '/' ) );
+	}
+
+	/**
+	 * True for the home page and for archives WordPress can serve: date, author, post type,
+	 * and term archives for terms that exist. Saves an HTTP check for each.
+	 */
+	private function is_known_archive( $url ) {
+		global $wp_rewrite;
+
+		parse_str( (string) wp_parse_url( $url, PHP_URL_QUERY ), $query );
+		if ( isset( $query['s'] ) || isset( $query['m'] ) || isset( $query['year'] ) ) {
+			return true;
+		}
+		if ( isset( $query['cat'] ) ) {
+			return get_term( (int) $query['cat'], 'category' ) instanceof WP_Term;
+		}
+		if ( isset( $query['tag'] ) ) {
+			return (bool) get_term_by( 'slug', sanitize_title( $query['tag'] ), 'post_tag' );
+		}
+		if ( isset( $query['author'] ) ) {
+			return (bool) get_userdata( (int) $query['author'] );
+		}
+		if ( isset( $query['post_type'] ) && ! isset( $query['p'] ) ) {
+			$type = get_post_type_object( sanitize_key( $query['post_type'] ) );
+			return $type && $type->has_archive;
+		}
+
+		$path = $this->relative_path( $url );
+		if ( '' === $path ) {
+			return true; // Home page.
+		}
+		if ( ! $wp_rewrite->using_permalinks() ) {
+			return false;
+		}
+
+		if ( preg_match( '#^(?:' . preg_quote( trim( $wp_rewrite->front, '/' ), '#' ) . '/)?\d{4}(?:/\d{2}(?:/\d{2})?)?$#', $path ) ) {
+			return true; // Date archive.
+		}
+
+		$author = $this->permastruct_match( $wp_rewrite->get_author_permastruct(), '%author%', $path );
+		if ( null !== $author ) {
+			return (bool) get_user_by( 'slug', $author );
+		}
+
+		foreach ( get_taxonomies( array( 'public' => true ), 'names' ) as $taxonomy ) {
+			$term = $this->permastruct_match( $wp_rewrite->get_extra_permastruct( $taxonomy ), '%' . $taxonomy . '%', $path );
+			if ( null !== $term ) {
+				// Hierarchical terms can be nested (parent/child); the last segment is the term.
+				$slug = basename( $term );
+				if ( get_term_by( 'slug', sanitize_title( $slug ), $taxonomy ) ) {
+					return true;
+				}
+			}
+		}
+
+		foreach ( get_post_types( array( 'public' => true ), 'names' ) as $type ) {
+			$link = get_post_type_archive_link( $type );
+			if ( $link && $this->relative_path( $link ) === $path ) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/**
+	 * The value matched by $tag when $path fits a permastruct like "/category/%category%",
+	 * or null when it doesn't fit.
+	 */
+	private function permastruct_match( $struct, $tag, $path ) {
+		$struct = trim( (string) $struct, '/' );
+		if ( '' === $struct || false === strpos( $struct, $tag ) ) {
+			return null;
+		}
+		$regex = '#^' . str_replace( preg_quote( $tag, '#' ), '(.+)', preg_quote( $struct, '#' ) ) . '$#';
+		return preg_match( $regex, $path, $m ) ? $m[1] : null;
+	}
+
+	/**
+	 * True when the path points at a file that exists in the uploads folder. Files that aren't
+	 * there locally (e.g. offloaded to a CDN) fall through to an HTTP check instead.
+	 */
+	private function is_existing_upload( $path ) {
+		$uploads = wp_get_upload_dir();
+		$base    = untrailingslashit( (string) wp_parse_url( $uploads['baseurl'], PHP_URL_PATH ) );
+		if ( '' === $base || 0 !== strpos( $path, $base . '/' ) ) {
+			return false;
+		}
+		$file = realpath( $uploads['basedir'] . rawurldecode( substr( $path, strlen( $base ) ) ) );
+		return $file && 0 === strpos( $file, realpath( $uploads['basedir'] ) ) && is_file( $file );
 	}
 
 	/**
@@ -455,7 +595,8 @@ class SEOHW_Audit {
 	 * front-end URL, since the WordPress back end may not serve pages at all. The safe
 	 * HTTP functions refuse private and internal addresses, including after redirects.
 	 *
-	 * @return int|false Status code, or false when unchecked or unreachable.
+	 * @return int|null Status code, 0 when there was no response, or null when the
+	 *                  per-audit limit was reached first.
 	 */
 	private function remote_status( $url ) {
 		$url = preg_replace( '#^https?://[^/]+#i', SEOHW_Settings::public_origin(), $url );
@@ -464,8 +605,7 @@ class SEOHW_Audit {
 			return $this->state['remote_cache'][ $url ];
 		}
 		if ( $this->state['remote_checked'] >= $this->remote_budget ) {
-			++$this->state['remote_skipped'];
-			return false;
+			return null;
 		}
 		++$this->state['remote_checked'];
 
@@ -482,8 +622,8 @@ class SEOHW_Audit {
 			$code     = is_wp_error( $response ) ? 0 : (int) wp_remote_retrieve_response_code( $response );
 		}
 
-		$this->state['remote_cache'][ $url ] = $code ? $code : false;
-		return $this->state['remote_cache'][ $url ];
+		$this->state['remote_cache'][ $url ] = $code;
+		return $code;
 	}
 
 	/**

@@ -17,6 +17,7 @@ $wpdb->query( "DELETE FROM {$wpdb->options} WHERE option_name LIKE '\\_transient
 
 wp_clear_scheduled_hook( 'seohw_daily_audit' );
 wp_clear_scheduled_hook( 'seohw_audit_continue' );
+wp_clear_scheduled_hook( 'seohw_refresh_report' );
 if ( function_exists( 'as_unschedule_all_actions' ) ) {
 	as_unschedule_all_actions( 'seohw_audit_continue' );
 }

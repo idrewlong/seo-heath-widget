@@ -432,6 +432,7 @@ class SEOHW_Settings {
 	public static function handle_refresh() {
 		self::guard( 'seohw_refresh' );
 		SEOHW_GSC_Client::flush_cache();
+		SEOHW_GSC_Client::refresh();
 		wp_safe_redirect( admin_url( 'index.php' ) );
 		exit;
 	}

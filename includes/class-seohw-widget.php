@@ -271,18 +271,40 @@ class SEOHW_Widget {
 			self::check_row( 'na', __( 'Noindex and meta description checks skipped: no supported SEO plugin is active.', 'seo-health-widget' ) );
 		}
 
+		$unchecked = (int) ( $audit['counts']['unchecked'] ?? 0 );
+
 		$broken_items = array();
 		foreach ( $audit['broken'] as $b ) {
-			$broken_items[] = self::post_link( $b['post'] ) . ' &rarr; <code>' . esc_html( self::short_url( $b['url'] ) ) . '</code> <span class="seohw-muted">(' . esc_html( self::reason( $b['reason'] ) ) . ')</span>';
+			$broken_items[] = self::link_item( $b );
 		}
 		self::list_row(
 			$audit['counts']['broken'],
 			'bad',
 			/* translators: %s: count */
 			_n( '%s broken internal link', '%s broken internal links', $audit['counts']['broken'], 'seo-health-widget' ),
-			__( 'No broken internal links found', 'seo-health-widget' ),
+			$unchecked
+				? __( 'No broken internal links among the links that could be checked', 'seo-health-widget' )
+				: __( 'No broken internal links found', 'seo-health-widget' ),
 			$broken_items
 		);
+
+		// Links whose status couldn't be confirmed are listed separately, so a check that
+		// failed is never mistaken for a clean result.
+		if ( $unchecked ) {
+			$items = array();
+			foreach ( $audit['unchecked'] as $u ) {
+				$items[] = self::link_item( $u );
+			}
+			self::list_row(
+				$unchecked,
+				'warn',
+				/* translators: %s: count */
+				_n( '%s internal link couldn’t be checked', '%s internal links couldn’t be checked', $unchecked, 'seo-health-widget' ),
+				'',
+				$items,
+				$is_admin ? self::unchecked_hint( $audit['unchecked'] ) : ''
+			);
+		}
 
 		if ( $audit['orphan_types'] ) {
 			self::list_row(
@@ -304,10 +326,6 @@ class SEOHW_Widget {
 			/* translators: 1: scanned, 2: total */
 			$notes[] = sprintf( __( 'first %1$s of %2$s items scanned', 'seo-health-widget' ), number_format_i18n( $audit['scanned'] ), number_format_i18n( $audit['total'] ) );
 		}
-		if ( $is_admin && $audit['remote_skipped'] ) {
-			/* translators: %s: count */
-			$notes[] = sprintf( __( '%s links not checked over HTTP (limit reached)', 'seo-health-widget' ), number_format_i18n( $audit['remote_skipped'] ) );
-		}
 		echo '<p class="seohw-muted">' . esc_html( implode( ' · ', $notes ) ) . '</p>';
 	}
 
@@ -322,8 +340,9 @@ class SEOHW_Widget {
 
 	/**
 	 * @param string[] $items Pre-escaped HTML list items.
+	 * @param string   $note  Optional plain-text note shown above the items.
 	 */
-	private static function list_row( $count, $bad_status, $label_plural, $ok_label, array $items ) {
+	private static function list_row( $count, $bad_status, $label_plural, $ok_label, array $items, $note = '' ) {
 		if ( ! $count ) {
 			self::check_row( 'ok', $ok_label );
 			return;
@@ -334,6 +353,9 @@ class SEOHW_Widget {
 			esc_attr( $bad_status ),
 			esc_html( sprintf( $label_plural, number_format_i18n( $count ) ) )
 		);
+		if ( '' !== $note ) {
+			echo '<li class="seohw-muted">' . esc_html( $note ) . '</li>';
+		}
 		foreach ( array_slice( $items, 0, self::SHOW_ITEMS ) as $item ) {
 			echo '<li>' . $item . '</li>'; // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- built from escaped parts.
 		}
@@ -363,8 +385,34 @@ class SEOHW_Widget {
 		return strlen( $short ) > 60 ? substr( $short, 0, 57 ) . '…' : $short;
 	}
 
+	/**
+	 * "Post → /path (reason)" for a broken or unchecked link.
+	 */
+	private static function link_item( array $link ) {
+		return self::post_link( $link['post'] ) . ' &rarr; <code>' . esc_html( self::short_url( $link['url'] ) ) . '</code> <span class="seohw-muted">(' . esc_html( self::reason( $link['reason'] ) ) . ')</span>';
+	}
+
+	/**
+	 * Admin-facing explanation of the most likely cause of unchecked links.
+	 */
+	private static function unchecked_hint( array $unchecked ) {
+		$reasons = array_column( $unchecked, 'reason' );
+		$blocked = array_intersect( $reasons, array( 'no_response', '401', '403', '429' ) );
+		if ( $blocked ) {
+			return __( 'The site didn’t answer, or refused, its own link checks. A security plugin, firewall (e.g. Cloudflare) or the host may be blocking requests from the server to itself. Allow the “SEO Health Widget” user agent or the server’s IP.', 'seo-health-widget' );
+		}
+		if ( in_array( 'limit', $reasons, true ) ) {
+			return __( 'The audit reached its limit of HTTP link checks. Raise it with the seohw_max_remote_checks filter.', 'seo-health-widget' );
+		}
+		return __( 'These links returned a server error when checked. They may be temporarily down.', 'seo-health-widget' );
+	}
+
 	private static function reason( $reason ) {
 		switch ( $reason ) {
+			case 'limit':
+				return __( 'check limit reached', 'seo-health-widget' );
+			case 'no_response':
+				return __( 'no response', 'seo-health-widget' );
 			case 'unpublished':
 				return __( 'unpublished', 'seo-health-widget' );
 			case 'deleted':

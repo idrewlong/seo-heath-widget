@@ -28,7 +28,7 @@ Version 0.1.0.
 - A trend line of daily clicks
 - The top 5 search queries
 
-You choose the comparison: last full month vs. the month before, or the last 28 days vs. the 28 days before.
+You choose the comparison: last full month vs. the month before, or the last 28 days vs. the 28 days before. Search Console data arrives 2–3 days late, so the 28-day window ends 3 days ago, and on the 1st–3rd of each month the month view keeps comparing the previous pair of full months until last month's data is complete.
 
 **Site audit**, run once a day on the site itself:
 
@@ -38,12 +38,13 @@ You choose the comparison: last full month vs. the month before, or the last 28 
 - Broken internal links: links to deleted or unpublished content, or to URLs that return 404/410
 - Orphaned pages: pages nothing links to, from content or menus
 
-Each issue expands to list the affected pages, with links to edit them.
+Each issue expands to list the affected pages, with links to edit them. If some links couldn't be checked (for example because the site blocks its own requests), the widget says so in a separate row, so a failed check is never mistaken for a clean result.
 
 ### How it works
 
 - The plugin connects to Search Console with a Google **service account**, a Google login for software. Each client gets their own service account, added read-only to their Search Console property. Clients don't have to sign in or share their Google accounts.
-- Search data is cached for 12 hours, so each site makes about 8 API calls a day. The Search Console API is free, and no Google billing account is needed.
+- Search data is refreshed in the background twice a day, so the dashboard loads without waiting on Google. That's about 8 API calls a day per site. The Search Console API is free, and no Google billing account is needed.
+- The link check works out most links from WordPress's own data (posts, pages, category/tag/author/date archives, uploaded files) and only requests the page over HTTP when it can't, up to 50 HTTP checks per audit.
 - The audit reads data from whichever SEO plugin is active: Yoast SEO, Rank Math, SEOPress or All in One SEO.
 - The audit runs on the site's own server, once a day. Large sites are checked in batches in the background, so it works on sites with thousands of pages.
 - It works on standard WordPress sites and on headless sites, where a separate front end (Next, Nuxt, etc.) serves the public pages. See [Headless sites](#headless-sites).
@@ -123,10 +124,12 @@ define( 'SEOHW_SERVICE_ACCOUNT_FILE', '/home/site/private/seohw-key.json' );
 | The PHP OpenSSL extension is required                     | Ask the host to enable OpenSSL.                                                                                       |
 | The saved service account key can't be decrypted          | The security keys in `wp-config.php` changed (for example after a migration or a security reset). Paste the key again, or switch to the key file. |
 | Headless site: many links reported as returning 404       | Check **Site type** is set to **Headless** and **Front-end URL** is the public site, not the WordPress back end.      |
+| "N internal links couldn't be checked" with "no response", 401, 403 or 429 | A security plugin, firewall (e.g. Cloudflare) or the host is blocking the site's requests to itself. Allow the `SEO Health Widget` user agent or the server's IP. |
+| "N internal links couldn't be checked" with "check limit reached" | The audit used its 50 HTTP checks. Raise the limit with the `seohw_max_remote_checks` filter.                        |
 | "Audit in progress" stays stuck for hours                 | WP-Cron only runs when someone visits the site. On low-traffic sites, set up a server cron for `wp-cron.php`. After an hour without progress, the next daily run starts over. |
 | "The first audit has not run yet" for more than a day     | WP-Cron isn't running. Click **Run audit now** and check the site's cron setup.                                       |
 
-Search data is cached for 12 hours. After changing settings, admins can click **Refresh search data** at the bottom of the widget to fetch it again straight away.
+Search data is refreshed in the background twice a day. After changing settings, admins can click **Refresh search data** at the bottom of the widget to fetch it straight away.
 
 ## Headless sites
 
@@ -174,12 +177,12 @@ add_filter( 'seohw_widget_capability', fn() => 'manage_options' );
 - A page counts as missing a meta description when the SEO plugin's per-page field is empty, even if the site outputs a templated one (such as the excerpt).
 - Noindex set for a whole post type in the SEO plugin's global settings isn't detected, only per-page settings.
 - Links are read from post content only. Links in page-builder layouts stored in post meta (Elementor, Divi) or in theme templates aren't scanned, so those pages can show as orphaned.
-- Search Console data lags 2–3 days, so the rolling 28-day period ends 3 days ago.
+- Archive links (categories, tags, authors, dates) count as working when the archive exists in WordPress. On a headless site, that assumes the front end uses the same URLs as WordPress.
 - On headless sites, a front end that returns a normal page (status 200) for every URL, including missing ones, hides broken links from the check. The front end should return a real 404 status for missing pages.
 
 ## Uninstalling
 
-Deleting the plugin from **Plugins** removes its settings, saved key, cached data, audit results and scheduled audit. If you used `SEOHW_SERVICE_ACCOUNT_FILE`, remove the key file and the `wp-config.php` line yourself.
+Deleting the plugin from **Plugins** removes its settings, saved key, cached data, audit results and scheduled tasks. If you used `SEOHW_SERVICE_ACCOUNT_FILE`, remove the key file and the `wp-config.php` line yourself.
 
 ## License
 
