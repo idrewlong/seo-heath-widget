@@ -20,11 +20,11 @@ define( 'SEOHW_OPTION', 'seohw_settings' );
 define( 'SEOHW_AUDIT_OPTION', 'seohw_audit_results' );
 define( 'SEOHW_CRON_HOOK', 'seohw_daily_audit' );
 
-require_once SEOHW_DIR . 'includes/class-seohw-settings.php';
-require_once SEOHW_DIR . 'includes/class-seohw-gsc-client.php';
-require_once SEOHW_DIR . 'includes/class-seohw-seo-meta.php';
-require_once SEOHW_DIR . 'includes/class-seohw-audit.php';
-require_once SEOHW_DIR . 'includes/class-seohw-widget.php';
+require_once SEOHW_DIR . 'includes/class-settings.php';
+require_once SEOHW_DIR . 'includes/class-gsc-client.php';
+require_once SEOHW_DIR . 'includes/class-seo-meta.php';
+require_once SEOHW_DIR . 'includes/class-audit.php';
+require_once SEOHW_DIR . 'includes/class-widget.php';
 
 SEOHW_Settings::init();
 SEOHW_GSC_Client::init();
